@@ -149,9 +149,9 @@ class MixerModel(nn.Module):
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
-        self.layers = nn.ModuleList(
-            [
-                create_block(
+        self.layers = nn.ModuleDict()
+        for i in range(n_layer):
+            self.layers[str(i)] = create_block(
                     d_model,
                     d_intermediate=d_intermediate,
                     ssm_cfg=ssm_cfg,
@@ -164,9 +164,6 @@ class MixerModel(nn.Module):
                     layer_idx=i,
                     **factory_kwargs,
                 )
-                for i in range(n_layer)
-            ]
-        )
 
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
@@ -184,16 +181,25 @@ class MixerModel(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
             i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
-            for i, layer in enumerate(self.layers)
+            for i, layer in self.layers.items()
         }
 
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
-        residual = None
-        for layer in self.layers:
+        # allow nonexistent embedding to support pipeline parallelism
+        # this applies to non-first stages, where input is the stack of [hidden_states, residual]
+        if not self.embedding:
+            hidden_states, residual = input_ids
+        else:
+            hidden_states = self.embedding(input_ids)
+            residual = None
+        for layer in self.layers.values():
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+        # allow nonexistent norm_f to support pipeline parallelism
+        # this applies to non-last stages, where we have to output both hidden_states and residual
+        if not self.norm_f:
+            return torch.stack([hidden_states, residual])
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -277,11 +283,16 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
         hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
+        # allow nonexistent lm_head to support pipeline parallelism
+        # this applies to non-last stages, the hidden_states here is the stack of [hidden_states, residual]
+        if not self.lm_head:
+            return hidden_states
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        # return logits directly rather than a CausalLMOutput object as pipeline needs to validate output
+        # shape thus requires a Tensor output.
+        return lm_logits
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
